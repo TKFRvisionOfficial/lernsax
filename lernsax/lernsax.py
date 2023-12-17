@@ -3,40 +3,101 @@
 """ LernSucks API Wrapper
 """
 
-# Standard library
-from lernsax.util import client
-from typing import List
-
-# 3rd-party dependencies
-import aiohttp
 import asyncio
+from typing import List, Union
+from aiohttp import ClientSession, BasicAuth, ClientResponse
+from lernsax.util import ApiClient
+import aiodav
+from importlib.util import find_spec
+from logging import getLogger
 
-# Package modules
+from time import asctime
 
-class Client(client.ApiClient):
+logger = getLogger(__name__)
+
+_ORJSON = find_spec("orjson")
+
+if _ORJSON: import orjson as json
+else: import json
+
+class HttpClient(ClientSession):
+    def __init__(self, *args, **kwargs) -> None:
+        self.api: str = kwargs.pop("api_uri", "https://www.lernsax.de/jsonrpc.php")
+        super().__init__(
+            *args,
+            **kwargs,
+            json_serialize= lambda obj, *args, **kwargs: json.dumps(obj).decode() if _ORJSON else json.dumps(obj)
+        )
+        
+    async def request(self, method, *args, **kwargs):
+        """
+        execute and log a request
+        """
+        url = kwargs.pop("url", self.api)  # Extrahiere die URL aus kwargs oder verwende die Standard-URL
+        response = await super().request(method, url, *args, **kwargs)
+        self.log_req(response)
+        return response
+
+    @staticmethod
+    def log_req(response: ClientResponse):
+        """
+        Method for logging requests
+        """
+        logger.debug(
+            f"{response.request_info.method} [{asctime()}] -> {response.url}: {response.status} [{response.content_type}]"\
+            f"Received Headers: {response.headers}"
+            )
+        
+class Client(ApiClient, aiodav.Client):
     """ Main object for handling LernSax access and responses. """
-    def __init__(self, email: str, password: str):
-        self.email = email
-        self.password = password
-        self.sid = ""
+
+    def __init__(self, email: str, password: str) -> None:
+        self.email: str = email
+        self.password: str = password
+        self.sid: str = ""
         self.member_of: List[str] = []
-        self.root_url = "https://www.lernsax.de"
-        self.api = f"{self.root_url}/jsonrpc.php"
-    def __await__(self):
-        return self._init().__await__()
-    async def _init(self):
-        self._session = aiohttp.ClientSession()
-        return self
-    def __del__(self):
+        self.background: asyncio.Task = asyncio.create_task(self.background_task())
+        
+        self.http: HttpClient = HttpClient()
+        self.dav_session: HttpClient = HttpClient(
+            auth = BasicAuth(self.email, self.password))
+        self.dav: aiodav.Client = aiodav.Client(
+            'https://www.lernsax.de/webdav.php/', login=self.email, password=self.password, session=self.dav_session)
+        
+        #* Copying Functions to this client so you don't need to call self.dav.func, higly bogded but it works
+        for func in dir(self.dav):
+            #* dont overwrite functions that already exist
+            if func not in dir(self):
+                #* copy the function or attr
+                setattr(self, func, getattr(self.dav, func)) 
+
+    async def post(self, json: Union[dict, list]) -> dict:
+        """
+        Send post request to LernSax
+        """
+        return await (await self.http.request("POST", json=json)).json()
+
+    async def exists(self, *args, **kwargs) -> bool:
+        """
+        Workaroung for LernSax WebDav not passing .exist() checks in aiodav even if the dir exists.
+        """
+        return True
+
+    async def background_task(self) -> None:
+        """
+        background task to run cleanup after shutting down and to continuously refresh the sesion
+        """
+        async def refresher():
+            #! refresh session every 5 minutes
+            while True:
+                if self.sid: print(await self.refresh_session())
+                await asyncio.sleep(60*5)
         try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._close_session())
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(self._close_session())
-    async def _close_session(self):
-        if not self._session.closed:
-            await self._session.close()
-    async def post(self, json) -> dict:
-        async with self._session.post(self.api, json=json) as f:
-            return await f.json()
+            await refresher()
+        finally:
+            await self.__cleanup()
+    
+    async def __cleanup(self):
+        if self.sid: await self.logout()
+        if not self.http.closed: await self.http.close()
+        if not self.dav_session.closed: await self.dav_session.close()
